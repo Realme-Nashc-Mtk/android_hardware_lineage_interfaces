@@ -7,6 +7,7 @@
 #include <dlfcn.h>
 #include <endian.h>
 #include <limits>
+#include <memory>
 
 #include <android-base/logging.h>
 
@@ -18,6 +19,17 @@ namespace aidl {
 namespace android {
 namespace hardware {
 namespace gatekeeper {
+
+class HalMemoryDeleter {
+public:
+    void operator()(uint8_t* ptr) const {
+        if (ptr) {
+            free(ptr);
+        }
+    }
+};
+
+using HalMemoryPtr = std::unique_ptr<uint8_t, HalMemoryDeleter>;
 
 Gatekeeper::Gatekeeper() {
     int ret = hw_get_module_by_class(GATEKEEPER_HARDWARE_MODULE_ID, NULL, &mModule);
@@ -31,21 +43,33 @@ Gatekeeper::Gatekeeper() {
         LOG(ERROR) << "Unable to open GateKeeper HAL.";
         abort();
     }
+
+    LOG(INFO) << "GateKeeper started";
 }
 
 Gatekeeper::~Gatekeeper() {
     if (mDevice != nullptr) {
         int ret = gatekeeper_close(mDevice);
         if (ret < 0) {
-            LOG(ERROR) << "Unable to close GateKeeper HAL.";
+            LOG(ERROR) << "Unable to close GateKeeper HAL: " << ret;
         }
+        mDevice = nullptr;
     }
-    dlclose(mModule->dso);
+
+    if (mModule != nullptr && mModule->dso != nullptr) {
+        dlclose(mModule->dso);
+        mModule = nullptr;
+    }
 }
 
 void legacyAuthToken2AidlHWToken(
         const hw_auth_token_t* authToken,
         android::hardware::security::keymint::HardwareAuthToken* aidlToken) {
+    if (!authToken || !aidlToken) {
+        LOG(ERROR) << "Invalid parameters to legacyAuthToken2AidlHWToken";
+        return;
+    }
+
     aidlToken->challenge = authToken->challenge;
     aidlToken->userId = authToken->user_id;
     aidlToken->authenticatorId = authToken->authenticator_id;
@@ -54,6 +78,7 @@ void legacyAuthToken2AidlHWToken(
             static_cast<android::hardware::security::keymint::HardwareAuthenticatorType>(
                     be32toh(authToken->authenticator_type));
     aidlToken->timestamp.milliSeconds = be64toh(authToken->timestamp);
+    aidlToken->mac.clear();
     aidlToken->mac.insert(aidlToken->mac.begin(), std::begin(authToken->hmac),
                           std::end(authToken->hmac));
 }
@@ -63,31 +88,60 @@ void legacyAuthToken2AidlHWToken(
                                         const std::vector<uint8_t>& currentPassword,
                                         const std::vector<uint8_t>& desiredPassword,
                                         GatekeeperEnrollResponse* rsp) {
-    uint8_t* enrolled_password_handle = nullptr;
-    uint32_t enrolled_password_handle_length = 0;
-
-    if (desiredPassword.size() == 0) {
+    if (!rsp) {
         return ndk::ScopedAStatus(AStatus_fromServiceSpecificError(ERROR_GENERAL_FAILURE));
     }
 
-    int ret = mDevice->enroll(
-            mDevice, uid, currentPasswordHandle.data(), currentPasswordHandle.size(),
-            currentPassword.data(), currentPassword.size(), desiredPassword.data(),
-            desiredPassword.size(), &enrolled_password_handle, &enrolled_password_handle_length);
+    if (desiredPassword.empty()) {
+        LOG(ERROR) << "Desired password cannot be empty";
+        return ndk::ScopedAStatus(AStatus_fromServiceSpecificError(ERROR_GENERAL_FAILURE));
+    }
 
-    if (!ret) {
+    // Validate input
+    if (currentPasswordHandle.size() > std::numeric_limits<uint32_t>::max() ||
+        currentPassword.size() > std::numeric_limits<uint32_t>::max() ||
+        desiredPassword.size() > std::numeric_limits<uint32_t>::max()) {
+        LOG(ERROR) << "Input size too large";
+        return ndk::ScopedAStatus(AStatus_fromServiceSpecificError(ERROR_GENERAL_FAILURE));
+    }
+
+    uint8_t* enrolled_password_handle = nullptr;
+    uint32_t enrolled_password_handle_length = 0;
+
+    int ret = mDevice->enroll(
+            mDevice, uid,
+            currentPasswordHandle.empty() ? nullptr : currentPasswordHandle.data(),
+            static_cast<uint32_t>(currentPasswordHandle.size()),
+            currentPassword.empty() ? nullptr : currentPassword.data(),
+            static_cast<uint32_t>(currentPassword.size()),
+            desiredPassword.data(),
+            static_cast<uint32_t>(desiredPassword.size()),
+            &enrolled_password_handle,
+            &enrolled_password_handle_length);
+
+    HalMemoryPtr handlePtr(enrolled_password_handle);
+
+    if (ret == 0) {
+        if (!enrolled_password_handle || enrolled_password_handle_length == 0) {
+            LOG(ERROR) << "HAL returned success but invalid handle";
+            return ndk::ScopedAStatus(AStatus_fromServiceSpecificError(ERROR_GENERAL_FAILURE));
+        }
+
         password_handle_t* _enrolled_password_handle =
                 reinterpret_cast<password_handle_t*>(enrolled_password_handle);
+
         *rsp = {STATUS_OK,
                 0,
                 static_cast<int64_t>(_enrolled_password_handle->user_id),
                 {enrolled_password_handle,
-                 (enrolled_password_handle + enrolled_password_handle_length)}};
+                 enrolled_password_handle + enrolled_password_handle_length}};
     } else if (ret > 0) {
         *rsp = {ERROR_RETRY_TIMEOUT, ret, 0, {}};
     } else {
+        LOG(ERROR) << "Enroll failed with error: " << ret;
         return ndk::ScopedAStatus(AStatus_fromServiceSpecificError(ERROR_GENERAL_FAILURE));
     }
+
     return ndk::ScopedAStatus::ok();
 }
 
@@ -95,24 +149,54 @@ void legacyAuthToken2AidlHWToken(
                                         const std::vector<uint8_t>& enrolledPasswordHandle,
                                         const std::vector<uint8_t>& providedPassword,
                                         GatekeeperVerifyResponse* rsp) {
+    if (!rsp) {
+        return ndk::ScopedAStatus(AStatus_fromServiceSpecificError(ERROR_GENERAL_FAILURE));
+    }
+
+    if (enrolledPasswordHandle.empty() || providedPassword.empty()) {
+        LOG(ERROR) << "Password handle and provided password cannot be empty";
+        return ndk::ScopedAStatus(AStatus_fromServiceSpecificError(ERROR_GENERAL_FAILURE));
+    }
+
+    // Validate input
+    if (enrolledPasswordHandle.size() > std::numeric_limits<uint32_t>::max() ||
+        providedPassword.size() > std::numeric_limits<uint32_t>::max()) {
+        LOG(ERROR) << "Input size too large";
+        return ndk::ScopedAStatus(AStatus_fromServiceSpecificError(ERROR_GENERAL_FAILURE));
+    }
+
     uint8_t* auth_token = nullptr;
     uint32_t auth_token_length = 0;
     bool request_reenroll = false;
 
-    int ret = mDevice->verify(mDevice, uid, challenge, enrolledPasswordHandle.data(),
-                              enrolledPasswordHandle.size(), providedPassword.data(),
-                              providedPassword.size(), &auth_token, &auth_token_length,
+    int ret = mDevice->verify(mDevice, uid, challenge,
+                              enrolledPasswordHandle.data(),
+                              static_cast<uint32_t>(enrolledPasswordHandle.size()),
+                              providedPassword.data(),
+                              static_cast<uint32_t>(providedPassword.size()),
+                              &auth_token, &auth_token_length,
                               &request_reenroll);
-    if (!ret) {
+
+    HalMemoryPtr tokenPtr(auth_token);
+
+    if (ret == 0) {
+        if (!auth_token || auth_token_length < sizeof(hw_auth_token_t)) {
+            LOG(ERROR) << "HAL returned success but invalid auth token";
+            return ndk::ScopedAStatus(AStatus_fromServiceSpecificError(ERROR_GENERAL_FAILURE));
+        }
+
         hw_auth_token_t* _auth_token = reinterpret_cast<hw_auth_token_t*>(auth_token);
+
         // On Success, return GatekeeperVerifyResponse with Success Status,
         // timeout{0} and valid HardwareAuthToken.
         *rsp = {request_reenroll ? STATUS_REENROLL : STATUS_OK, 0, {}};
+
         // Convert the hw_auth_token_t to HardwareAuthToken in the response.
         legacyAuthToken2AidlHWToken(_auth_token, &rsp->hardwareAuthToken);
     } else if (ret > 0) {
         *rsp = {ERROR_RETRY_TIMEOUT, ret, {}};
     } else {
+        LOG(ERROR) << "Verify failed with error: " << ret;
         return ndk::ScopedAStatus(AStatus_fromServiceSpecificError(ERROR_GENERAL_FAILURE));
     }
 
@@ -120,28 +204,32 @@ void legacyAuthToken2AidlHWToken(
 }
 
 ::ndk::ScopedAStatus Gatekeeper::deleteUser(int32_t uid) {
-    if (mDevice->delete_user) {
-        int ret = mDevice->delete_user(mDevice, uid);
-        if (!ret) {
-            return ndk::ScopedAStatus::ok();
-        } else {
-            return ndk::ScopedAStatus(AStatus_fromServiceSpecificError(ERROR_GENERAL_FAILURE));
-        }
-    } else {
+    if (!mDevice->delete_user) {
+        LOG(WARNING) << "delete_user not implemented in HAL";
         return ndk::ScopedAStatus(AStatus_fromServiceSpecificError(ERROR_NOT_IMPLEMENTED));
+    }
+
+    int ret = mDevice->delete_user(mDevice, uid);
+    if (ret == 0) {
+        return ndk::ScopedAStatus::ok();
+    } else {
+        LOG(ERROR) << "deleteUser failed with error: " << ret;
+        return ndk::ScopedAStatus(AStatus_fromServiceSpecificError(ERROR_GENERAL_FAILURE));
     }
 }
 
 ::ndk::ScopedAStatus Gatekeeper::deleteAllUsers() {
-    if (mDevice->delete_all_users) {
-        int ret = mDevice->delete_all_users(mDevice);
-        if (!ret) {
-            return ndk::ScopedAStatus::ok();
-        } else {
-            return ndk::ScopedAStatus(AStatus_fromServiceSpecificError(ERROR_GENERAL_FAILURE));
-        }
-    } else {
+    if (!mDevice->delete_all_users) {
+        LOG(WARNING) << "delete_all_users not implemented in HAL";
         return ndk::ScopedAStatus(AStatus_fromServiceSpecificError(ERROR_NOT_IMPLEMENTED));
+    }
+
+    int ret = mDevice->delete_all_users(mDevice);
+    if (ret == 0) {
+        return ndk::ScopedAStatus::ok();
+    } else {
+        LOG(ERROR) << "deleteAllUsers failed with error: " << ret;
+        return ndk::ScopedAStatus(AStatus_fromServiceSpecificError(ERROR_GENERAL_FAILURE));
     }
 }
 

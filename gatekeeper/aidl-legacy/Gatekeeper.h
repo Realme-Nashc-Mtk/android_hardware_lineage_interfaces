@@ -10,6 +10,7 @@
 #include <hardware/gatekeeper.h>
 #include <hardware/hardware.h>
 #include <hardware/hw_auth_token.h>
+#include <memory>
 
 namespace aidl {
 namespace android {
@@ -59,6 +60,9 @@ class Gatekeeper : public BnGatekeeper {
   private:
     gatekeeper_device_t* mDevice;
     const hw_module_t* mModule;
+
+    Gatekeeper(const Gatekeeper&) = delete;
+    Gatekeeper& operator=(const Gatekeeper&) = delete;
 };
 
 }  // namespace gatekeeper

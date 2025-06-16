@@ -9,6 +9,8 @@
 #include <android-base/logging.h>
 #include <android/binder_manager.h>
 #include <android/binder_process.h>
+#include <cstdlib>
+
 #include "Gatekeeper.h"
 
 using aidl::android::hardware::gatekeeper::Gatekeeper;
@@ -16,14 +18,15 @@ using aidl::android::hardware::gatekeeper::Gatekeeper;
 int main() {
     ABinderProcess_setThreadPoolMaxThreadCount(0);
 
-    std::shared_ptr<Gatekeeper> gatekeeper = ndk::SharedRefBase::make<Gatekeeper>();
+    const std::shared_ptr<Gatekeeper> gatekeeper = ndk::SharedRefBase::make<Gatekeeper>();
 
-    const std::string instance = std::string() + Gatekeeper::descriptor + "/default";
+    const std::string instance = std::string(Gatekeeper::descriptor) + "/default";
     binder_status_t status =
             AServiceManager_addService(gatekeeper->asBinder().get(), instance.c_str());
     CHECK_EQ(status, STATUS_OK);
 
     ABinderProcess_joinThreadPool();
 
-    return -1;  // Should never get here.
+    // This should never happen
+    return EXIT_FAILURE;
 }
